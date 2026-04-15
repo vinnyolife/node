@@ -12,7 +12,6 @@
 #include "src/codegen/machine-type.h"
 #include "src/compiler/turboshaft/assembler.h"
 #include "src/compiler/turboshaft/operations.h"
-#include "src/compiler/turboshaft/phase.h"
 #include "src/compiler/wasm-compiler.h"
 #include "src/compiler/wasm-graph-assembler.h"
 #include "src/wasm/wasm-engine.h"
@@ -20,6 +19,16 @@
 namespace v8::internal::compiler::turboshaft {
 
 #include "src/compiler/turboshaft/define-assembler-macros.inc"
+
+constexpr MachineRepresentation kCWasmEntrySigReps[] = {
+    kCWasmEntrySigTypes[0].representation(),
+    kCWasmEntrySigTypes[1].representation(),
+    kCWasmEntrySigTypes[2].representation(),
+    kCWasmEntrySigTypes[3].representation(),
+    kCWasmEntrySigTypes[4].representation()};
+
+constexpr Signature<MachineRepresentation> kCWasmEntryRepSig(
+    1, 4, kCWasmEntrySigReps);
 
 // This reducer is run on 32 bit platforms to lower unsupported 64 bit integer
 // operations to supported 32 bit operations.
@@ -39,8 +48,12 @@ class Int64LoweringReducer : public Next {
                                   : wasm::kCalledFromWasm;
     // To compute the machine signature, it doesn't matter whether types
     // are canonicalized, just use whichever signature is present (functions
-    // will have one and wrappers the other).
-    if (__ data()->wasm_module_sig()) {
+    // will have one and wrappers the other). For CWasmEntry jobs, the
+    // stored signature describes the Wasm function called by the wrapper, so we
+    // materialize the wrapper's signature here.
+    if (__ data()->info()->code_kind() == CodeKind::C_WASM_ENTRY) {
+      sig_ = &kCWasmEntryRepSig;
+    } else if (__ data()->wasm_module_sig()) {
       sig_ =
           CreateMachineSignature(zone_, __ data()->wasm_module_sig(), origin);
     } else {
@@ -363,8 +376,9 @@ class Int64LoweringReducer : public Next {
 
   V<None> REDUCE(Store)(OpIndex base, OptionalOpIndex index, OpIndex value,
                         StoreOp::Kind kind, MemoryRepresentation stored_rep,
-                        WriteBarrierKind write_barrier, int32_t offset,
-                        uint8_t element_size_log2,
+                        WriteBarrierKind write_barrier,
+                        std::optional<AtomicMemoryOrder> memory_order,
+                        int32_t offset, uint8_t element_size_log2,
                         bool maybe_initializing_or_transitioning,
                         IndirectPointerTag maybe_indirect_pointer_tag) {
     if (stored_rep == MemoryRepresentation::Int64() ||
@@ -380,11 +394,14 @@ class Int64LoweringReducer : public Next {
         }
         // Manually subtract the pointer tag if present.
         offset -= kind.tagged_base;
+        // For now, we keep seqcst semantics for 8-byte stores on ia32.
+        // In future, if we want to improve performance on ia32, we will
+        // consider updating this part.
         return __ AtomicWord32PairStore(base, index, low, high, offset);
       }
       // low store
       Next::ReduceStore(base, index, low, kind, MemoryRepresentation::Int32(),
-                        write_barrier, offset, element_size_log2,
+                        write_barrier, memory_order, offset, element_size_log2,
                         maybe_initializing_or_transitioning,
                         maybe_indirect_pointer_tag);
       // high store
@@ -392,14 +409,14 @@ class Int64LoweringReducer : public Next {
           IncreaseOffset(index, offset, sizeof(int32_t), kind.tagged_base);
       Next::ReduceStore(
           base, high_index, high, kind, MemoryRepresentation::Int32(),
-          write_barrier, high_offset, element_size_log2,
+          write_barrier, memory_order, high_offset, element_size_log2,
           maybe_initializing_or_transitioning, maybe_indirect_pointer_tag);
       return V<None>::Invalid();
     }
-    return Next::ReduceStore(base, index, value, kind, stored_rep,
-                             write_barrier, offset, element_size_log2,
-                             maybe_initializing_or_transitioning,
-                             maybe_indirect_pointer_tag);
+    return Next::ReduceStore(
+        base, index, value, kind, stored_rep, write_barrier, memory_order,
+        offset, element_size_log2, maybe_initializing_or_transitioning,
+        maybe_indirect_pointer_tag);
   }
 
   OpIndex REDUCE(AtomicRMW)(OpIndex base, OpIndex index, OpIndex value,
@@ -477,8 +494,8 @@ class Int64LoweringReducer : public Next {
       const MakeTupleOp& tuple =
           __ Get(output_index).template Cast<MakeTupleOp>();
       DCHECK_EQ(tuple.input_count, 2);
-      OpIndex new_inputs[2] = {__ MapToNewGraph(input_phi.input(0)),
-                               __ MapToNewGraph(input_phi.input(1))};
+      OpIndex new_inputs[2] = {__ MapToNewGraph(input_phi.forward_edge()),
+                               __ MapToNewGraph(input_phi.back_edge())};
       for (size_t i = 0; i < 2; ++i) {
         OpIndex phi_index = tuple.input(i);
         if (!output_graph_loop->Contains(phi_index)) {

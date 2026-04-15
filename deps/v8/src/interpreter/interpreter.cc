@@ -66,18 +66,6 @@ Interpreter::Interpreter(Isolate* isolate)
     : isolate_(isolate),
       interpreter_entry_trampoline_instruction_start_(kNullAddress) {
   memset(dispatch_table_, 0, sizeof(dispatch_table_));
-
-  if (V8_IGNITION_DISPATCH_COUNTING_BOOL) {
-    InitDispatchCounters();
-  }
-}
-
-void Interpreter::InitDispatchCounters() {
-  static const int kBytecodeCount = static_cast<int>(Bytecode::kLast) + 1;
-  bytecode_dispatch_counters_table_.reset(
-      new uintptr_t[kBytecodeCount * kBytecodeCount]);
-  memset(bytecode_dispatch_counters_table_.get(), 0,
-         sizeof(uintptr_t) * kBytecodeCount * kBytecodeCount);
 }
 
 namespace {
@@ -227,7 +215,8 @@ template <typename IsolateT>
 void InterpreterCompilationJob::CheckAndPrintBytecodeMismatch(
     IsolateT* isolate, Handle<Script> script,
     DirectHandle<BytecodeArray> bytecode) {
-  int first_mismatch = generator()->CheckBytecodeMatches(*bytecode);
+  Handle<BytecodeArray> handle(*bytecode, isolate);
+  int first_mismatch = generator()->CheckBytecodeMatches(handle);
   if (first_mismatch >= 0) {
     parse_info()->ast_value_factory()->Internalize(isolate);
     DeclarationScope::AllocateScopeInfos(parse_info(), script, isolate);
@@ -369,7 +358,18 @@ void Interpreter::Initialize() {
   DCHECK(!code->has_instruction_stream());
   interpreter_entry_trampoline_instruction_start_ = code->instruction_start();
 
-  // Initialize the dispatch table.
+  // Initialize the dispatch table with pointers to IllegalHandler.
+  // This way, if we ever run into a situation where an invalid/unknown opcode
+  // is executed, this will be reported as a sandbox violation. This is
+  // important as such crashes are typically the symptom of a bug that could
+  // lead to arbitrary, attacker-controlled bytecode execution, which would
+  // allow breaking out of the sandbox.
+  Tagged<Code> illegal_bytecode_handler =
+      builtins->code(Builtin::kIllegalHandler);
+  for (int i = 0; i < kDispatchTableSize; ++i) {
+    dispatch_table_[i] = illegal_bytecode_handler->instruction_start();
+  }
+
   ForEachBytecode([=, this](Bytecode bytecode, OperandScale operand_scale) {
     Builtin builtin = BuiltinIndexFromBytecode(bytecode, operand_scale);
     Tagged<Code> handler = builtins->code(builtin);
@@ -392,56 +392,6 @@ void Interpreter::Initialize() {
 
 bool Interpreter::IsDispatchTableInitialized() const {
   return dispatch_table_[0] != kNullAddress;
-}
-
-uintptr_t Interpreter::GetDispatchCounter(Bytecode from, Bytecode to) const {
-  int from_index = Bytecodes::ToByte(from);
-  int to_index = Bytecodes::ToByte(to);
-  CHECK_WITH_MSG(bytecode_dispatch_counters_table_ != nullptr,
-                 "Dispatch counters require building with "
-                 "v8_enable_ignition_dispatch_counting");
-  return bytecode_dispatch_counters_table_[from_index * kNumberOfBytecodes +
-                                           to_index];
-}
-
-DirectHandle<JSObject> Interpreter::GetDispatchCountersObject() {
-  DirectHandle<JSObject> counters_map =
-      isolate_->factory()->NewJSObjectWithNullProto();
-
-  // Output is a JSON-encoded object of objects.
-  //
-  // The keys on the top level object are source bytecodes,
-  // and corresponding value are objects. Keys on these last are the
-  // destinations of the dispatch and the value associated is a counter for
-  // the correspondent source-destination dispatch chain.
-  //
-  // Only non-zero counters are written to file, but an entry in the top-level
-  // object is always present, even if the value is empty because all counters
-  // for that source are zero.
-
-  for (int from_index = 0; from_index < kNumberOfBytecodes; ++from_index) {
-    Bytecode from_bytecode = Bytecodes::FromByte(from_index);
-    DirectHandle<JSObject> counters_row =
-        isolate_->factory()->NewJSObjectWithNullProto();
-
-    for (int to_index = 0; to_index < kNumberOfBytecodes; ++to_index) {
-      Bytecode to_bytecode = Bytecodes::FromByte(to_index);
-      uintptr_t counter = GetDispatchCounter(from_bytecode, to_bytecode);
-
-      if (counter > 0) {
-        DirectHandle<Object> value =
-            isolate_->factory()->NewNumberFromSize(counter);
-        JSObject::AddProperty(isolate_, counters_row,
-                              Bytecodes::ToString(to_bytecode), value, NONE);
-      }
-    }
-
-    JSObject::AddProperty(isolate_, counters_map,
-                          Bytecodes::ToString(from_bytecode), counters_row,
-                          NONE);
-  }
-
-  return counters_map;
 }
 
 }  // namespace interpreter

@@ -6,12 +6,12 @@
 
 #include "src/execution/microtask-queue.h"
 #include "src/objects/objects-inl.h"
+#include "src/sandbox/sandboxable-thread.h"
 #include "src/wasm/function-compiler.h"
 #include "src/wasm/wasm-engine.h"
 #include "src/wasm/wasm-module-builder.h"
 #include "src/wasm/wasm-module.h"
 #include "src/wasm/wasm-objects-inl.h"
-
 #include "test/cctest/cctest.h"
 #include "test/common/wasm/test-signatures.h"
 #include "test/common/wasm/wasm-macro-gen.h"
@@ -40,8 +40,8 @@ class SharedEngineIsolate {
     zone_.reset(new Zone(isolate()->allocator(), ZONE_NAME));
   }
   ~SharedEngineIsolate() {
-    v8_isolate()->Exit();
     zone_.reset();
+    v8_isolate()->Exit();
     isolate_->Dispose();
   }
 
@@ -59,7 +59,9 @@ class SharedEngineIsolate {
 
   DirectHandle<WasmInstanceObject> ImportInstance(SharedModule shared_module) {
     DirectHandle<WasmModuleObject> module_object =
-        GetWasmEngine()->ImportNativeModule(isolate(), shared_module, {});
+        GetWasmEngine()
+            ->ImportNativeModule(isolate(), shared_module, {})
+            .ToHandleChecked();
     ErrorThrower thrower(isolate(), "ImportInstance");
     MaybeDirectHandle<WasmInstanceObject> instance =
         GetWasmEngine()->SyncInstantiate(isolate(), &thrower, module_object, {},
@@ -68,7 +70,7 @@ class SharedEngineIsolate {
   }
 
   SharedModule ExportInstance(DirectHandle<WasmInstanceObject> instance) {
-    return instance->module_object()->shared_native_module();
+    return instance->module_object()->native_module().as_shared_ptr();
   }
 
   int32_t Run(DirectHandle<WasmInstanceObject> instance) {
@@ -82,14 +84,13 @@ class SharedEngineIsolate {
 
 // Helper class representing a Thread running its own instance of an Isolate
 // with a shared WebAssembly engine available at construction time.
-class SharedEngineThread : public v8::base::Thread {
+class SharedEngineThread : public v8::internal::SandboxableThread {
  public:
   explicit SharedEngineThread(
       std::function<void(SharedEngineIsolate*)> callback)
-      : Thread(Options("SharedEngineThread")), callback_(callback) {}
+      : SandboxableThread(Options("SharedEngineThread")), callback_(callback) {}
 
   void Run() override {
-    v8::SandboxHardwareSupport::PrepareCurrentThreadForHardwareSandboxing();
     SharedEngineIsolate isolate;
     callback_(&isolate);
   }

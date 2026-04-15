@@ -4,21 +4,12 @@
 
 #include "src/wasm/wrappers.h"
 
-#include <bit>
-#include <optional>
-
-#include "src/base/small-vector.h"
-#include "src/codegen/bailout-reason.h"
 #include "src/codegen/interface-descriptors-inl.h"
 #include "src/compiler/linkage.h"
 #include "src/compiler/turboshaft/dataview-lowering-reducer.h"
-#include "src/compiler/turboshaft/index.h"
 #include "src/compiler/turboshaft/select-lowering-reducer.h"
 #include "src/compiler/turboshaft/variable-reducer.h"
-#include "src/execution/isolate-data.h"
-#include "src/objects/object-list-macros.h"
 #include "src/wasm/turboshaft-graph-interface-inl.h"
-#include "src/wasm/wasm-engine.h"
 #include "src/wasm/wasm-module.h"
 #include "src/wasm/wasm-objects.h"
 #include "src/wasm/wrappers-inl.h"
@@ -45,26 +36,27 @@ const compiler::turboshaft::TSCallDescriptor* GetBuiltinCallDescriptor(
 }
 
 void BuildWasmWrapper(compiler::turboshaft::PipelineData* data,
-                      AccountingAllocator* allocator,
                       compiler::turboshaft::Graph& graph,
                       const CanonicalSig* sig,
                       WrapperCompilationInfo wrapper_info) {
-  Zone zone(allocator, ZONE_NAME);
-  using Assembler = compiler::turboshaft::TSAssembler<
+  Zone zone(data->allocator(), ZONE_NAME);
+  using WrapperAssembler = compiler::turboshaft::Assembler<
       compiler::turboshaft::SelectLoweringReducer,
       compiler::turboshaft::DataViewLoweringReducer,
       compiler::turboshaft::VariableReducer>;
-  Assembler assembler(data, graph, graph, &zone);
-  WasmWrapperTSGraphBuilder<Assembler> builder(data->isolate(), &zone,
-                                               assembler, sig);
+  WrapperAssembler assembler(data, graph, graph, &zone);
+  WasmWrapperTSGraphBuilder<WrapperAssembler> builder(
+      &zone, assembler, sig, /*is_inlining_into_js*/ false);
   if (wrapper_info.code_kind == CodeKind::JS_TO_WASM_FUNCTION) {
-    builder.BuildJSToWasmWrapper(wrapper_info.receiver_is_first_param);
+    builder.BuildJSToWasmWrapper();
   } else if (wrapper_info.code_kind == CodeKind::WASM_TO_JS_FUNCTION) {
     builder.BuildWasmToJSWrapper(wrapper_info.import_kind,
                                  wrapper_info.expected_arity,
                                  wrapper_info.suspend);
   } else if (wrapper_info.code_kind == CodeKind::WASM_TO_CAPI_FUNCTION) {
     builder.BuildCapiCallWrapper();
+  } else if (wrapper_info.code_kind == CodeKind::C_WASM_ENTRY) {
+    builder.BuildCWasmEntryWrapper();
   } else if (wrapper_info.code_kind == CodeKind::WASM_STACK_ENTRY) {
     builder.BuildWasmStackEntryWrapper();
   } else {

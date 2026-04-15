@@ -72,35 +72,38 @@ V8_EXPORT_PRIVATE wasm::WasmCompilationResult CompileWasmImportCallWrapper(
     wasm::ImportCallKind, const wasm::CanonicalSig*, int expected_arity,
     wasm::Suspend);
 
-V8_EXPORT_PRIVATE wasm::WasmCompilationResult CompileWasmStackEntryWrapper();
+V8_EXPORT_PRIVATE wasm::WasmCompilationResult CompileWasmStackEntryWrapper(
+    const wasm::CanonicalSig* sig);
 
 // Compiles a host call wrapper, which allows Wasm to call host functions.
 wasm::WasmCompilationResult CompileWasmCapiCallWrapper(
     const wasm::CanonicalSig*);
 
-bool IsFastCallSupportedSignature(const v8::CFunctionInfo*);
 // Compiles a wrapper to call a Fast API function from Wasm.
 wasm::WasmCompilationResult CompileWasmJSFastCallWrapper(
     const wasm::CanonicalSig*, DirectHandle<JSReceiver> callable);
 
 // Returns a TurboshaftCompilationJob object for a JS to Wasm wrapper.
 std::unique_ptr<OptimizedCompilationJob> NewJSToWasmCompilationJob(
-    Isolate* isolate, const wasm::CanonicalSig* sig,
-    bool receiver_is_first_param);
-
-enum CWasmEntryParameters {
-  kCodeEntry,
-  kObjectRef,
-  kArgumentsBuffer,
-  kCEntryFp,
-  // marker:
-  kNumParameters
-};
+    Isolate* isolate, const wasm::CanonicalSig* sig);
 
 // Compiles a stub with C++ linkage, to be called from Execution::CallWasm,
 // which knows how to feed it its parameters.
 V8_EXPORT_PRIVATE Handle<Code> CompileCWasmEntry(Isolate*,
                                                  const wasm::CanonicalSig*);
+
+constexpr MachineType kCWasmEntrySigTypes[] = {
+    MachineType::Pointer(),    // return
+    MachineType::Uint32(),     // target
+    MachineType::AnyTagged(),  // object_ref
+    MachineType::Pointer(),    // argv
+    MachineType::Pointer()};   // c_entry_fp
+
+constexpr MachineSignature kCWasmEntrySig(1, 4, kCWasmEntrySigTypes);
+
+constexpr const MachineSignature* CWasmEntrySignature() {
+  return &kCWasmEntrySig;
+}
 
 struct WasmLoopInfo {
   Node* header;
@@ -215,10 +218,6 @@ class WasmGraphBuilder {
   Node* BuildLoadIsolateRoot();
   Node* UndefinedValue();
 
-  const Operator* GetSafeLoadOperator(int offset, wasm::ValueTypeBase type);
-  Node* BuildSafeStore(int offset, wasm::ValueTypeBase type, Node* arg_buffer,
-                       Node* value, Node* effect, Node* control);
-
   Node* BuildCallNode(size_t param_count, base::Vector<Node*> args,
                       wasm::WasmCodePosition position, Node* instance_node,
                       const Operator* op, Node* frame_state = nullptr);
@@ -237,8 +236,6 @@ class WasmGraphBuilder {
 
   Node* BuildCallToRuntimeWithContext(Runtime::FunctionId f, Node* js_context,
                                       Node** parameters, int parameter_count);
-
-  TrapId GetTrapIdForTrap(wasm::TrapReason reason);
 
   Node* BuildChangeInt64ToBigInt(Node* input, StubCallMode stub_mode);
 

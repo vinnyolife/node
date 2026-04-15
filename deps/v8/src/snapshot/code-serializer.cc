@@ -201,7 +201,7 @@ void CodeSerializer::SerializeObjectImpl(Handle<HeapObject> obj,
     DisallowGarbageCollection no_gc;
     Tagged<SharedFunctionInfo> sfi = Cast<SharedFunctionInfo>(*obj);
     if (restore_bytecode) {
-      sfi->SetActiveBytecodeArray(debug_info->DebugBytecodeArray(isolate()),
+      sfi->SetActiveBytecodeArray(debug_info->debug_bytecode_array(isolate()),
                                   isolate());
     }
     if (v8_flags.profile_guided_optimization &&
@@ -697,7 +697,9 @@ CodeSerializer::FinishOffThreadDeserialize(
           reinterpret_cast<void*>(source->ptr()));
     }
 #else
-    CHECK_EQ(result_script->source(), ReadOnlyRoots(isolate).empty_string());
+    // Check whether the source is reclaimed (replaced by empty string) or
+    // unreclaimable (already a read-only string).
+    CHECK(HeapLayout::InReadOnlySpace(result_script->source()));
 #endif
     Script::SetSource(isolate, result_script, source);
 

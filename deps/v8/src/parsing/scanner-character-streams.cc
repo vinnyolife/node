@@ -9,6 +9,7 @@
 
 #include "include/v8-callbacks.h"
 #include "include/v8-primitive.h"
+#include "src/base/iterator.h"
 #include "src/base/strings.h"
 #include "src/common/globals.h"
 #include "src/execution/isolate-utils.h"
@@ -193,9 +194,8 @@ class ChunkedStream {
     }
 
     // Walk backwards.
-    for (auto reverse_it = chunks_->rbegin(); reverse_it != chunks_->rend();
-         ++reverse_it) {
-      if (reverse_it->position <= position) return *reverse_it;
+    for (Chunk& chunk : base::Reversed(*chunks_)) {
+      if (chunk.position <= position) return chunk;
     }
 
     UNREACHABLE();
@@ -914,7 +914,7 @@ std::unique_ptr<Utf16CharacterStream> ScannerStream::ForTesting(
   if (data == nullptr) {
     DCHECK_EQ(length, 0);
 
-    // We don't want to pass in a null pointer into the the character stream,
+    // We don't want to pass in a null pointer into the character stream,
     // because then the one-past-the-end pointer is undefined, so instead pass
     // through this static array.
     static const char non_null_empty_string[1] = {0};
@@ -931,7 +931,7 @@ std::unique_ptr<Utf16CharacterStream> ScannerStream::ForTesting(
   if (data == nullptr) {
     DCHECK_EQ(length, 0);
 
-    // We don't want to pass in a null pointer into the the character stream,
+    // We don't want to pass in a null pointer into the character stream,
     // because then the one-past-the-end pointer is undefined, so instead pass
     // through this static array.
     static const uint16_t non_null_empty_uint16_t_string[1] = {0};

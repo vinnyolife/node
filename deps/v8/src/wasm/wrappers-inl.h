@@ -16,6 +16,9 @@
 
 namespace v8::internal::wasm {
 
+using compiler::turboshaft::WasmBodyInliningResult;
+using TSBlock = compiler::turboshaft::Block;
+
 #include "src/compiler/turboshaft/define-assembler-macros.inc"
 
 template <typename Assembler>
@@ -35,7 +38,7 @@ auto WasmWrapperTSGraphBuilder<Assembler>::BuildChangeInt32ToNumber(
     compiler::turboshaft::V<Word32> value) -> V<Number> {
   // We expect most integers at runtime to be Smis, so it is important for
   // wrapper performance that Smi conversion be inlined.
-  if (SmiValuesAre32Bits()) {
+  if constexpr (SmiValuesAre32Bits()) {
     return BuildChangeInt32ToSmi(value);
   }
   DCHECK(SmiValuesAre31Bits());
@@ -49,7 +52,7 @@ auto WasmWrapperTSGraphBuilder<Assembler>::BuildChangeInt32ToNumber(
     // value.
     result = __ BitcastWordPtrToSmi(
         __ ChangeInt32ToIntPtr(__ template Projection<0>(add)));
-  } ELSE{
+  } ELSE {
     // Otherwise, call builtin, to convert to a HeapNumber.
     result = CallBuiltin<WasmInt32ToHeapNumberDescriptor>(
         Builtin::kWasmInt32ToHeapNumber, Operator::kNoProperties, value);
@@ -65,7 +68,11 @@ auto WasmWrapperTSGraphBuilder<Assembler>::ToJS(OpIndex ret,
   if (type.is_numeric()) {
     switch (type.numeric_kind()) {
       case NumericKind::kI32:
-        return BuildChangeInt32ToNumber(ret);
+        // When inlining into JS, emit a "high-level" JS conversion to allow
+        // further optimizations. These are lowered in the MachineLoweringPhase
+        // in the JS pipeline.
+        return is_inlining_into_js_ ? __ ConvertInt32ToNumber(ret)
+                                    : BuildChangeInt32ToNumber(ret);
       case NumericKind::kI64:
         return this->BuildChangeInt64ToBigInt(
             ret, StubCallMode::kCallBuiltinPointer);
@@ -77,6 +84,7 @@ auto WasmWrapperTSGraphBuilder<Assembler>::ToJS(OpIndex ret,
       case NumericKind::kI8:
       case NumericKind::kI16:
       case NumericKind::kF16:
+      case NumericKind::kWaitQueue:
         UNREACHABLE();
     }
   }
@@ -85,35 +93,38 @@ auto WasmWrapperTSGraphBuilder<Assembler>::ToJS(OpIndex ret,
     // Function reference. Extract the external function.
     ScopedVar<Object> result(this, OpIndex::Invalid());
     if (type.is_nullable()) {
-      IF (__ TaggedEqual(ret, LOAD_ROOT(WasmNull))) {
-        result = LOAD_ROOT(NullValue);
-      } ELSE{
+      IF (__ TaggedEqual(ret, __ template LoadRoot<RootIndex::kWasmNull>())) {
+        result = __ template LoadRoot<RootIndex::kNullValue>();
+      } ELSE {
         V<WasmInternalFunction> internal = V<WasmInternalFunction>::Cast(
-            __ LoadTrustedPointerField(ret, LoadOp::Kind::TaggedBase(),
-                                       kWasmInternalFunctionIndirectPointerTag,
-                                       WasmFuncRef::kTrustedInternalOffset));
+            __ LoadTrustedPointer(ret, LoadOp::Kind::TaggedBase(),
+                                  kWasmInternalFunctionIndirectPointerTag,
+                                  WasmFuncRef::kTrustedInternalOffset));
         V<Object> maybe_external =
             __ Load(internal, LoadOp::Kind::TaggedBase(),
                     MemoryRepresentation::AnyTagged(),
                     WasmInternalFunction::kExternalOffset);
-        IF (__ TaggedEqual(maybe_external, LOAD_ROOT(UndefinedValue))) {
+        IF (__ TaggedEqual(
+                maybe_external,
+                __ template LoadRoot<RootIndex::kUndefinedValue>())) {
           result = CallBuiltin<WasmInternalFunctionCreateExternalDescriptor>(
               Builtin::kWasmInternalFunctionCreateExternal,
               Operator::kNoProperties, internal, context);
-        } ELSE{
+        } ELSE {
           result = maybe_external;
         }
       }
     } else {
       // Non-nullable funcref.
       V<WasmInternalFunction> internal = V<WasmInternalFunction>::Cast(
-          __ LoadTrustedPointerField(ret, LoadOp::Kind::TaggedBase(),
-                                     kWasmInternalFunctionIndirectPointerTag,
-                                     WasmFuncRef::kTrustedInternalOffset));
+          __ LoadTrustedPointer(ret, LoadOp::Kind::TaggedBase(),
+                                kWasmInternalFunctionIndirectPointerTag,
+                                WasmFuncRef::kTrustedInternalOffset));
       result = __ Load(internal, LoadOp::Kind::TaggedBase(),
                        MemoryRepresentation::TaggedPointer(),
                        WasmInternalFunction::kExternalOffset);
-      IF (__ TaggedEqual(result, LOAD_ROOT(UndefinedValue))) {
+      IF (__ TaggedEqual(result,
+                         __ template LoadRoot<RootIndex::kUndefinedValue>())) {
         result = CallBuiltin<WasmInternalFunctionCreateExternalDescriptor>(
             Builtin::kWasmInternalFunctionCreateExternal,
             Operator::kNoProperties, internal, context);
@@ -122,17 +133,41 @@ auto WasmWrapperTSGraphBuilder<Assembler>::ToJS(OpIndex ret,
     return result;
   }
 
-  // Cases that are never or always null:
+  // Always null.
+  if (type.is_none_type()) return __ template LoadRoot<RootIndex::kNullValue>();
+
+  if (IsSubtypeOf(type, kWasmSharedExternRef)) {
+    // We have to unshare shared strings before passing them to JS.
+    ScopedVar<Object> result(this, OpIndex::Invalid());
+    IF (__ IsSmi(ret)) {
+      result = ret;
+    } ELSE {
+      OpIndex instance_type = LoadInstanceType(LoadMap(ret));
+      V<Word32> is_string = __ Uint32LessThan(
+          instance_type, __ Word32Constant(FIRST_NONSTRING_TYPE));
+      IF (is_string) {
+        // Since this is a shared externref, the string will be shared.
+        result =
+            __ WasmCallRuntime(__ phase_zone(), Runtime::kWasmWasmToJSObject,
+                               {ret}, __ NoContextConstant());
+      } ELSE {
+        result = ret;
+      }
+    }
+    return result;
+  }
+
+  // At this point, we only have to process WasmNull.
+  // These two cases are never WasmNull.
   if (!type.is_nullable()) return ret;
   if (!type.use_wasm_null()) return ret;
-  if (type.is_none_type()) return LOAD_ROOT(NullValue);
 
   // Nullable reference. Convert WasmNull if needed.
   ScopedVar<Object> result(this, OpIndex::Invalid());
-  IF_NOT (__ TaggedEqual(ret, LOAD_ROOT(WasmNull))) {
+  IF_NOT (__ TaggedEqual(ret, __ template LoadRoot<RootIndex::kWasmNull>())) {
     result = ret;
-  } ELSE{
-    result = LOAD_ROOT(NullValue);
+  } ELSE {
+    result = __ template LoadRoot<RootIndex::kNullValue>();
   }
   return result;
 }
@@ -173,8 +208,7 @@ void WasmWrapperTSGraphBuilder<Assembler>::BuildCallWasmFromWrapper(
 template <typename Assembler>
 auto WasmWrapperTSGraphBuilder<Assembler>::BuildCallAndReturn(
     V<Context> js_context, V<HeapObject> function_data,
-    base::Vector<OpIndex> args, bool do_conversion,
-    OptionalV<FrameState> frame_state,
+    base::Vector<OpIndex> args, OptionalV<FrameState> frame_state,
     compiler::LazyDeoptOnThrow lazy_deopt_on_throw) -> OpIndex {
   const int rets_count = static_cast<int>(sig_->return_count());
   base::SmallVector<OpIndex, 1> rets(rets_count);
@@ -192,11 +226,10 @@ auto WasmWrapperTSGraphBuilder<Assembler>::BuildCallAndReturn(
 
   V<Object> jsval;
   if (sig_->return_count() == 0) {
-    DCHECK_NOT_NULL(isolate_);
-    jsval = __ HeapConstant(isolate_->factory()->undefined_value());
+    DCHECK_NOT_NULL(__ data()->isolate());
+    jsval = __ HeapConstant(__ data()->isolate()->factory()->undefined_value());
   } else if (sig_->return_count() == 1) {
-    jsval =
-        do_conversion ? ToJS(rets[0], sig_->GetReturn(), js_context) : rets[0];
+    jsval = ToJS(rets[0], sig_->GetReturn(), js_context);
   } else {
     int32_t return_count = static_cast<int32_t>(sig_->return_count());
     V<Smi> size = __ SmiConstant(Smi::FromInt(return_count));
@@ -219,51 +252,74 @@ auto WasmWrapperTSGraphBuilder<Assembler>::BuildCallAndReturn(
 template <typename Assembler>
 auto WasmWrapperTSGraphBuilder<Assembler>::InlineWasmFunctionInsideWrapper(
     V<Context> js_context, V<WasmFunctionData> function_data,
-    base::Vector<OpIndex> inlined_args, bool do_conversion,
-    OptionalV<FrameState> frame_state,
+    base::Vector<OpIndex> inlined_args, OptionalV<FrameState> frame_state,
     compiler::LazyDeoptOnThrow lazy_deopt_on_throw) -> V<Object> {
   if constexpr (requires(const Assembler& assembler) {
                   assembler.has_wasm_in_js_inlining_reducer;
                 }) {
     if (inlined_function_data_.has_value()) {
       CHECK(v8_flags.turboshaft_wasm_in_js_inlining);
-      OptionalV<Any> wasmval =
-          static_cast<Assembler*>(&Asm())->TryInlineWasmCall(
-              inlined_function_data_->native_module,
-              inlined_function_data_->function_index, inlined_args);
-      if (wasmval.has_value()) {
-        DCHECK_LE(sig_->return_count(), 1);
-        if (sig_->return_count() == 0) {
-          DCHECK_NOT_NULL(isolate_);
-          return __ HeapConstant(isolate_->factory()->undefined_value());
-        } else {  // sig_->return_count() == 1.
-          return ToJS(wasmval.value(), sig_->GetReturn(), js_context);
-        }
+      WasmBodyInliningResult inlining_result =
+          static_cast<Assembler*>(&Asm())->TryInlineWasmBody(
+              inlined_function_data_.value(), inlined_args,
+              lazy_deopt_on_throw);
+      // If the body inlining traps unconditionally (e.g., due to an
+      // unreachable) no need to produce/convert a result.
+      if (__ generating_unreachable_operations()) {
+        return OpIndex::Invalid();
+      }
+      switch (inlining_result.type) {
+        case WasmBodyInliningResult::Type::kSuccessWithValue:
+          DCHECK_EQ(sig_->return_count(), 1);
+          DCHECK(inlining_result.value.valid());
+          return ToJS(inlining_result.value.value(), sig_->GetReturn(),
+                      js_context);
+        case WasmBodyInliningResult::Type::kSuccessVoid:
+          DCHECK_EQ(sig_->return_count(), 0);
+          DCHECK_NOT_NULL(__ data()->isolate());
+          DCHECK(!inlining_result.value.valid());
+          return __ HeapConstant(
+              __ data()->isolate()->factory()->undefined_value());
+        case WasmBodyInliningResult::Type::kFailed:
+          // Do nothing, building non-inlined call is handled below.
+          break;
       }
     }
   }
 
   // If the wasm function was not inlined, we need to call it.
   return BuildCallAndReturn(js_context, function_data, inlined_args,
-                            do_conversion, frame_state, lazy_deopt_on_throw);
+                            frame_state, lazy_deopt_on_throw);
 }
 
 template <typename Assembler>
 auto WasmWrapperTSGraphBuilder<Assembler>::BuildJSToWasmWrapperImpl(
-    bool receiver_is_first_param, V<JSFunction> js_closure,
-    V<Context> js_context, base::Vector<const OpIndex> arguments,
-    OptionalV<FrameState> frame_state,
-    compiler::LazyDeoptOnThrow lazy_deopt_on_throw) -> V<Any> {
-  const bool do_conversion = true;
+    V<JSFunction> js_closure, V<Context> js_context,
+    base::Vector<const OpIndex> arguments,
+    OptionalV<FrameState> lazy_frame_state,
+    compiler::LazyDeoptOnThrow lazy_deopt_on_throw,
+    OptionalV<FrameState> eager_frame_state) -> V<Any> {
+  // These parameters are all set if and only if we are inlining the wrapper.
+  DCHECK_EQ(is_inlining_into_js_, js_closure.valid());
+  DCHECK_EQ(is_inlining_into_js_, js_context.valid());
+  DCHECK_EQ(is_inlining_into_js_, lazy_frame_state.valid());
+  // We only need an `eager_frame_state` if there actually are arguments to
+  // convert.
   const int wasm_param_count = static_cast<int>(sig_->parameter_count());
-  const int args_count = wasm_param_count + 1;  // +1 for wasm_code.
+  DCHECK_EQ(is_inlining_into_js_ && wasm_param_count > 0,
+            eager_frame_state.valid());
 
   __ Bind(__ NewBlock());
 
-  base::SmallVector<OpIndex, 16> params(args_count);
-  const int param_offset = receiver_is_first_param ? 0 : 1;
-  if (js_closure.valid()) {
-    DCHECK(js_context.valid());
+  base::SmallVector<OpIndex, 16> params(wasm_param_count);
+  const int param_offset = 1;  // Skip the JS receiver.
+  if (is_inlining_into_js_) {
+    // We only marked this call for inlining in Turbolev if the argument counts
+    // matched already there.
+    // Note that the JS `CallOp` in Turboshaft contains extra arguments at the
+    // end (e.g. argument count, context), see `turbolev-graph-builder.cc`,
+    // hence we `CHECK_GE` here.
+    CHECK_GE(arguments.size(), wasm_param_count + param_offset);
 
     // Prepare Param() nodes. Param() nodes can only be created once, so we
     // need to use the same nodes along all possible transformation paths.
@@ -286,7 +342,7 @@ auto WasmWrapperTSGraphBuilder<Assembler>::BuildJSToWasmWrapperImpl(
   }
 
   if (!IsJSCompatibleSignature(sig_)) {
-    // Throw a TypeError. Use the js_context of the calling javascript
+    // Throw a TypeError. Use the js_context of the calling JavaScript
     // function (passed as a parameter), such that the generated code is
     // js_context independent.
     __ WasmCallRuntime(__ phase_zone(), Runtime::kWasmThrowJSTypeError, {},
@@ -295,101 +351,48 @@ auto WasmWrapperTSGraphBuilder<Assembler>::BuildJSToWasmWrapperImpl(
     return OpIndex::Invalid();
   }
 
-  // Check whether the signature of the function allows for a fast
-  // transformation (if any params exist that need transformation).
-  // Create a fast transformation path, only if it does.
-  bool include_fast_path =
-      do_conversion && wasm_param_count > 0 && QualifiesForFastTransform();
+  V<SharedFunctionInfo> sfi =
+      __ Load(js_closure, LoadOp::Kind::TaggedBase().Immutable(),
+              MemoryRepresentation::TaggedPointer(),
+              JSFunction::kSharedFunctionInfoOffset);
+  V<WasmFunctionData> function_data = V<WasmFunctionData>::Cast(
+      __ LoadTrustedPointer(sfi, LoadOp::Kind::TaggedBase().Immutable(),
+                            kWasmExportedFunctionDataIndirectPointerTag,
+                            SharedFunctionInfo::kTrustedFunctionDataOffset));
+  // If we are not inlining the Wasm body, we don't need the Wasm instance.
 
-  V<SharedFunctionInfo> shared = __ Load(js_closure, LoadOp::Kind::TaggedBase(),
-                                         MemoryRepresentation::TaggedPointer(),
-                                         JSFunction::kSharedFunctionInfoOffset);
-  V<WasmFunctionData> function_data =
-      V<WasmFunctionData>::Cast(__ LoadTrustedPointerField(
-          shared, LoadOp::Kind::TaggedBase(),
-          kWasmFunctionDataIndirectPointerTag,
-          SharedFunctionInfo::kTrustedFunctionDataOffset));
-  // If we are not inlining, we don't need the wasm instance.
   V<WasmTrustedInstanceData> instance_data =
       inlined_function_data_.has_value()
           ? V<WasmTrustedInstanceData>::Cast(__ LoadProtectedPointerField(
-                function_data, LoadOp::Kind::TaggedBase(),
+                function_data, LoadOp::Kind::TaggedBase().Immutable(),
                 WasmExportedFunctionData::kProtectedInstanceDataOffset))
           : OpIndex::Invalid();
 
-  Label<Object> done(&Asm());
-  V<Object> jsval;
-  if (include_fast_path) {
-    TSBlock* slow_path = __ NewBlock();
-    // Check if the params received on runtime can be actually transformed
-    // using the fast transformation. When a param that cannot be transformed
-    // fast is encountered, skip checking the rest and fall back to the slow
-    // path.
-    for (int i = 0; i < wasm_param_count; ++i) {
-      CanTransformFast(params[i], sig_->GetParam(i), slow_path);
-    }
-    // Convert JS parameters to wasm numbers using the fast transformation
-    // and build the call.
-    base::SmallVector<OpIndex, 16> args(args_count);
-    args[0] = instance_data;
-    for (int i = 0; i < wasm_param_count; ++i) {
-      OpIndex wasm_param = FromJSFast(params[i], sig_->GetParam(i));
-      args[i + 1] = wasm_param;
-    }
-
-    // Inline the wasm function, if possible.
-    jsval = InlineWasmFunctionInsideWrapper(js_context, function_data,
-                                            VectorOf(args), do_conversion,
-                                            frame_state, lazy_deopt_on_throw);
-
-    GOTO(done, jsval);
-    __ Bind(slow_path);
-  }
-
   // Convert JS parameters to wasm numbers using the default transformation
   // and build the call.
+  const int args_count = wasm_param_count + /* instance_data */ 1;
   base::SmallVector<OpIndex, 16> args(args_count);
   args[0] = instance_data;
   for (int i = 0; i < wasm_param_count; ++i) {
-    if (do_conversion) {
-      args[i + 1] =
-          FromJS(params[i], js_context, sig_->GetParam(i), frame_state);
-    } else {
-      OpIndex wasm_param = params[i];
-
-      // For Float32 parameters
-      // we set UseInfo::CheckedNumberOrOddballAsFloat64 in
-      // simplified-lowering and we need to add here a conversion from Float64
-      // to Float32.
-      if (sig_->GetParam(i).kind() == kF32) {
-        wasm_param = __ TruncateFloat64ToFloat32(wasm_param);
-      }
-      args[i + 1] = wasm_param;
-    }
+    args[i + 1] =
+        FromJS(params[i], js_context, sig_->GetParam(i), eager_frame_state);
   }
 
   // Inline the wasm function, if possible.
-  jsval = InlineWasmFunctionInsideWrapper(js_context, function_data,
-                                          VectorOf(args), do_conversion,
-                                          frame_state, lazy_deopt_on_throw);
-
-  // If both the default and a fast transformation paths are present,
-  // get the return value based on the path used.
-  if (include_fast_path) {
-    GOTO(done, jsval);
-    BIND(done, result);
-    return result;
-  } else {
-    return jsval;
-  }
+  V<Object> jsval =
+      InlineWasmFunctionInsideWrapper(js_context, function_data, VectorOf(args),
+                                      lazy_frame_state, lazy_deopt_on_throw);
+  return jsval;
 }
 
 template <typename Assembler>
-void WasmWrapperTSGraphBuilder<Assembler>::BuildJSToWasmWrapper(
-    bool receiver_is_first_param) {
+void WasmWrapperTSGraphBuilder<Assembler>::BuildJSToWasmWrapper() {
+  // JS-to-Wasm wrappers are compiled per isolate, so they can emit
+  // isolate-dependent code.
+  DCHECK_NOT_NULL(__ data()->isolate());
   V<Any> result = BuildJSToWasmWrapperImpl(
-      receiver_is_first_param, OpIndex::Invalid(), OpIndex::Invalid(), {}, {},
-      compiler::LazyDeoptOnThrow::kNo);
+      OpIndex::Invalid(), OpIndex::Invalid(), {}, {},
+      compiler::LazyDeoptOnThrow::kNo, OpIndex::Invalid());
   if (result != OpIndex::Invalid()) {  // Invalid signature.
     __ Return(result);
   }
@@ -398,6 +401,8 @@ void WasmWrapperTSGraphBuilder<Assembler>::BuildJSToWasmWrapper(
 template <typename Assembler>
 void WasmWrapperTSGraphBuilder<Assembler>::BuildWasmToJSWrapper(
     ImportCallKind kind, int expected_arity, Suspend suspend) {
+  // Wasm-to-JS wrappers need to be isolate-independent (as of now).
+  DCHECK_NULL(__ data()->isolate());
   int wasm_count = static_cast<int>(sig_->parameter_count());
 
   __ Bind(__ NewBlock());
@@ -422,7 +427,8 @@ void WasmWrapperTSGraphBuilder<Assembler>::BuildWasmToJSWrapper(
     return;
   }
 
-  V<Undefined> undefined_node = LOAD_ROOT(UndefinedValue);
+  V<Undefined> undefined_node =
+      __ template LoadRoot<RootIndex::kUndefinedValue>();
   int pushed_count = std::max(expected_arity, wasm_count);
   // 5 extra arguments: receiver, new target, arg count, dispatch handle and
   // context.
@@ -456,10 +462,10 @@ void WasmWrapperTSGraphBuilder<Assembler>::BuildWasmToJSWrapper(
     if (v8_flags.stress_wasm_stack_switching) {
       V<Word32> for_stress_testing = __ TaggedEqual(
           __ LoadTaggedField(suspender, WasmSuspenderObject::kResumeOffset),
-          LOAD_ROOT(UndefinedValue));
+          __ template LoadRoot<RootIndex::kUndefinedValue>());
       IF (for_stress_testing) {
-        __ WasmCallRuntime(__ phase_zone(), Runtime::kThrowWasmSuspendError, {},
-                           native_context);
+        __ WasmCallRuntime(__ phase_zone(), Runtime::kThrowWasmJSPISuspendError,
+                           {}, native_context);
         __ Unreachable();
       }
     }
@@ -471,8 +477,8 @@ void WasmWrapperTSGraphBuilder<Assembler>::BuildWasmToJSWrapper(
     OpIndex active_stack_has_js_frames =
         __ WordPtrEqual(__ IntPtrConstant(0), old_sp);
     IF (active_stack_has_js_frames) {
-      __ WasmCallRuntime(__ phase_zone(), Runtime::kThrowWasmSuspendError, {},
-                         native_context);
+      __ WasmCallRuntime(__ phase_zone(), Runtime::kThrowWasmJSPISuspendError,
+                         {}, native_context);
       __ Unreachable();
     }
     if (v8_flags.experimental_wasm_wasmfx) {
@@ -484,8 +490,8 @@ void WasmWrapperTSGraphBuilder<Assembler>::BuildWasmToJSWrapper(
       OpIndex has_js_frames = this->CallC(
           &sig, ExternalReference::wasm_suspender_has_js_frames(), {isolate});
       IF (has_js_frames) {
-        __ WasmCallRuntime(__ phase_zone(), Runtime::kThrowWasmSuspendError, {},
-                           native_context);
+        __ WasmCallRuntime(__ phase_zone(), Runtime::kThrowWasmJSPISuspendError,
+                           {}, native_context);
         __ Unreachable();
       }
     }
@@ -594,25 +600,57 @@ void WasmWrapperTSGraphBuilder<Assembler>::BuildWasmStackEntryWrapper() {
   __ Bind(__ NewBlock());
   V<WordPtr> stack_metadata =
       __ Parameter(0, RegisterRepresentation::WordPtr());
+  V<WordPtr> arg_buffer = __ Parameter(1, RegisterRepresentation::WordPtr());
   V<WasmFuncRef> func_ref =
       __ Load(stack_metadata, LoadOp::Kind::RawAligned(),
               MemoryRepresentation::UncompressedTaggedPointer(),
               StackMemory::func_ref_offset());
   AbortIfNot(__ HasInstanceType(func_ref, WASM_FUNC_REF_TYPE),
              AbortReason::kUnexpectedInstanceType);
-  V<WasmInternalFunction> internal_function =
-      V<WasmInternalFunction>::Cast(__ LoadTrustedPointerField(
-          func_ref, LoadOp::Kind::TaggedBase().Immutable(),
-          kWasmInternalFunctionIndirectPointerTag,
-          WasmFuncRef::kTrustedInternalOffset));
+  V<WasmInternalFunction> internal_function = V<WasmInternalFunction>::Cast(
+      __ LoadTrustedPointer(func_ref, LoadOp::Kind::TaggedBase().Immutable(),
+                            kWasmInternalFunctionIndirectPointerTag,
+                            WasmFuncRef::kTrustedInternalOffset));
   auto [target, instance] =
       this->BuildFunctionTargetAndImplicitArg(internal_function);
-  OpIndex arg = instance;
-  BuildCallWasmFromWrapper(__ phase_zone(), sig_, target,
-                           base::VectorOf(&arg, 1), {}, {},
+
+  base::Vector<OpIndex> args =
+      __ phase_zone()
+          -> template AllocateVector<OpIndex>(1 + sig_->parameter_count());
+  args[0] = instance;
+  // Unpack continuation params.
+  IterateWasmFXArgBuffer(sig_->parameters(), [&](size_t index, int offset) {
+    CanonicalValueType type = sig_->GetParam(index);
+    // On-stack refs are uncompressed.
+    MemoryRepresentation rep =
+        type.is_ref()
+            ? MemoryRepresentation::AnyUncompressedTagged()
+            : MemoryRepresentation::FromMachineType(type.machine_type());
+    args[index + 1] = __ LoadOffHeap(arg_buffer, offset, rep);
+  });
+
+  base::Vector<OpIndex> returns =
+      __ phase_zone() -> template AllocateVector<OpIndex>(sig_->return_count());
+  BuildCallWasmFromWrapper(__ phase_zone(), sig_, target, args, returns, {},
                            compiler::LazyDeoptOnThrow::kNo);
+
+  auto [size, alignment] = GetBufferSizeAndAlignmentFor(sig_->returns());
+  // The stack is not freed immediately on return, so the pointer stays valid
+  // until its use in the parent stack.
+  OpIndex result_buffer =
+      __ StackSlot(size, std::max(2 * kSystemPointerSize, alignment));
+  IterateWasmFXArgBuffer(sig_->returns(), [&](size_t index, int offset) {
+    CanonicalValueType type = sig_->GetReturn(index);
+    // On-stack refs are uncompressed.
+    MemoryRepresentation rep =
+        type.is_ref()
+            ? MemoryRepresentation::AnyUncompressedTagged()
+            : MemoryRepresentation::FromMachineType(type.machine_type());
+    __ StoreOffHeap(result_buffer, returns[index], rep, offset);
+  });
+
   CallBuiltin<WasmFXReturnDescriptor>(Builtin::kWasmFXReturn,
-                                      Operator::kNoProperties);
+                                      Operator::kNoProperties, result_buffer);
   __ Unreachable();
 }
 
@@ -655,11 +693,10 @@ void WasmWrapperTSGraphBuilder<Assembler>::BuildCapiCallWrapper() {
   V<Object> function_node =
       __ LoadTaggedField(incoming_params[0], WasmImportData::kCallableOffset);
   V<HeapObject> shared = LoadSharedFunctionInfo(function_node);
-  V<WasmFunctionData> function_data =
-      V<WasmFunctionData>::Cast(__ LoadTrustedPointerField(
-          shared, LoadOp::Kind::TaggedBase(),
-          kWasmFunctionDataIndirectPointerTag,
-          SharedFunctionInfo::kTrustedFunctionDataOffset));
+  V<WasmFunctionData> function_data = V<WasmFunctionData>::Cast(
+      __ LoadTrustedPointer(shared, LoadOp::Kind::TaggedBase(),
+                            kWasmCapiFunctionDataIndirectPointerTag,
+                            SharedFunctionInfo::kTrustedFunctionDataOffset));
   V<Object> host_data_foreign = __ LoadTaggedField(
       function_data, WasmCapiFunctionData::kEmbedderDataOffset);
 
@@ -712,6 +749,77 @@ void WasmWrapperTSGraphBuilder<Assembler>::BuildCapiCallWrapper() {
     }
     __ Return(__ Word32Constant(0), base::VectorOf(returns));
   }
+}
+
+template <typename Assembler>
+void WasmWrapperTSGraphBuilder<Assembler>::BuildCWasmEntryWrapper() {
+  __ Bind(__ NewBlock());
+
+  V<Word32> code_entry = __ Parameter(CWasmEntryParameters::kCodeEntry,
+                                      RegisterRepresentation::Word32());
+  V<Object> object_ref = __ Parameter(CWasmEntryParameters::kObjectRef,
+                                      RegisterRepresentation::Tagged());
+  V<WordPtr> arg_buffer = __ Parameter(CWasmEntryParameters::kArgumentsBuffer,
+                                       RegisterRepresentation::WordPtr());
+  V<WordPtr> c_entry_fp = __ Parameter(CWasmEntryParameters::kCEntryFp,
+                                       RegisterRepresentation::WordPtr());
+
+  V<WordPtr> fp_value = __ FramePointer();
+  __ Store(fp_value, c_entry_fp, StoreOp::Kind::RawAligned(),
+           MemoryRepresentation::UintPtr(), compiler::kNoWriteBarrier,
+           TypedFrameConstants::kFirstPushedFrameValueOffset);
+
+  size_t wasm_arg_count = sig_->parameter_count();
+  base::SmallVector<OpIndex, 16> args(wasm_arg_count + 1);  // +1 for instance.
+
+  size_t pos = 0;
+  V<WasmTrustedInstanceData> instance_data = V<WasmTrustedInstanceData>::Cast(
+      __ LoadTrustedPointer(V<HeapObject>::Cast(object_ref),
+                            LoadOp::Kind::TaggedBase().Immutable(),
+                            kWasmTrustedInstanceDataIndirectPointerTag,
+                            WasmInstanceObject::kTrustedDataOffset));
+  args[pos++] = instance_data;
+
+  int offset = 0;
+  for (CanonicalValueType type : sig_->parameters()) {
+    args[pos++] = SafeLoad(arg_buffer, offset, type);
+    offset += type.value_kind_size();
+  }
+
+  const TSCallDescriptor* descriptor = TSCallDescriptor::Create(
+      compiler::GetWasmCallDescriptor(
+          __ graph_zone(), sig_, compiler::WasmCallKind::kWasmIndirectFunction,
+          false),
+      compiler::CanThrow::kYes, compiler::LazyDeoptOnThrow::kNo,
+      __ graph_zone());
+
+  TSBlock* catch_block = __ NewBlock();
+  OpIndex call;
+  {
+    typename Assembler::CatchScope scope(Asm(), catch_block);
+    OpIndex frame_state = OpIndex::Invalid();
+    call = __ Call(code_entry, frame_state, base::VectorOf(args), descriptor,
+                   OpEffects().CanCallAnything());
+  }
+
+  // Handle success: store the return value(s).
+  size_t return_count = sig_->return_count();
+  if (return_count == 1) {
+    SafeStore(0, sig_->GetReturn(), arg_buffer, call);
+  } else if (return_count > 1) {
+    offset = 0;
+    for (size_t i = 0; i < return_count; ++i) {
+      CanonicalValueType type = sig_->GetReturn(i);
+      OpIndex val = __ Projection(call, i, this->RepresentationFor(type));
+      SafeStore(offset, type, arg_buffer, val);
+      offset += type.value_kind_size();
+    }
+  }
+  __ Return(__ IntPtrConstant(0));
+
+  __ Bind(catch_block);
+  V<Object> exception = __ CatchBlockBegin();
+  __ Return(exception);
 }
 
 #include "src/compiler/turboshaft/undef-assembler-macros.inc"

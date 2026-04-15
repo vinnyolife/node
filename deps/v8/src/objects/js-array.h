@@ -54,7 +54,8 @@ class JSArray : public TorqueGeneratedJSArray<JSArray, JSObject> {
   // capacity is non-zero.
   V8_EXPORT_PRIVATE static void Initialize(Isolate* isolate,
                                            DirectHandle<JSArray> array,
-                                           int capacity, int length = 0);
+                                           uint32_t capacity,
+                                           uint32_t length = 0);
 
   // If the JSArray has fast elements, and new_length would result in
   // normalization, returns true.
@@ -108,11 +109,9 @@ class JSArray : public TorqueGeneratedJSArray<JSArray, JSObject> {
   // - {raw_fixed_array} is a tagged FixedArray pointer.
   // - {raw_separator} and {raw_dest} are tagged String pointers.
   // - Returns a tagged String pointer.
-  static Address ArrayJoinConcatToSequentialString(Isolate* isolate,
-                                                   Address raw_list_head,
-                                                   intptr_t last_chunk_length,
-                                                   Address raw_separator,
-                                                   Address raw_dest);
+  static Address ArrayJoinConcatToSequentialString(
+      Isolate* isolate, Address raw_list_head, uintptr_t raw_last_chunk_length,
+      Address raw_separator, Address raw_dest);
 
   // Checks whether the Array has the current realm's Array.prototype as its
   // prototype. This function is best-effort and only gives a conservative
@@ -131,6 +130,11 @@ class JSArray : public TorqueGeneratedJSArray<JSArray, JSObject> {
 
   // Max. number of elements being copied in Array builtins.
   static const int kMaxCopyElements = 100;
+
+  // Maximum array length for which Maglev/TurboFan inline an insertion sort
+  // instead of calling the generic TimSort builtin.  TimSort itself uses
+  // BinaryInsertionSort below this threshold too.
+  static constexpr int kMaxInlineSortLength = 16;
 
   // Valid array indices range from +0 <= i < 2^32 - 1 (kMaxUInt32).
   static constexpr uint32_t kMaxArrayLength = JSObject::kMaxElementCount;
@@ -156,7 +160,7 @@ class JSArray : public TorqueGeneratedJSArray<JSArray, JSObject> {
 };
 
 // The JSArrayIterator describes JavaScript Array Iterators Objects, as
-// defined in ES section #sec-array-iterator-objects.
+// defined in https://tc39.es/ecma262/#sec-array-iterator-objects.
 class JSArrayIterator
     : public TorqueGeneratedJSArrayIterator<JSArrayIterator, JSObject> {
  public:

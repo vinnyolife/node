@@ -7,6 +7,7 @@
 
 #include "include/v8-wasm.h"
 #include "src/api/api-inl.h"
+#include "src/objects/managed.h"
 #include "src/objects/objects-inl.h"
 #include "src/snapshot/code-serializer.h"
 #include "src/utils/version.h"
@@ -64,18 +65,17 @@ class WasmSerializationTest {
     memset(const_cast<uint8_t*>(wire_bytes_.data()), 0, wire_bytes_.size() / 2);
   }
 
-  void PartlyDropTieringBudget() {
-    serialized_bytes_ = {serialized_bytes_.data(),
-                         serialized_bytes_.size() - 1};
-  }
-
   MaybeDirectHandle<WasmModuleObject> Deserialize(
       base::Vector<const char> source_url = {}) {
+    // Create a separate copy because some tests want to deserialize multiple
+    // times.
+    base::OwnedVector<const uint8_t> wire_bytes_copy =
+        base::OwnedCopyOf(wire_bytes_);
     return DeserializeNativeModule(
         CcTest::i_isolate(),
         WasmEnabledFeatures::FromIsolate(CcTest::i_isolate()),
-        base::VectorOf(serialized_bytes_), base::VectorOf(wire_bytes_),
-        compile_imports_, source_url);
+        base::VectorOf(serialized_bytes_), wire_bytes_copy, compile_imports_,
+        source_url);
   }
 
   void DeserializeAndRun() {
@@ -148,7 +148,7 @@ class WasmSerializationTest {
               MakeCompileTimeImports(), &thrower, base::OwnedCopyOf(buffer));
       DirectHandle<WasmModuleObject> module_object =
           maybe_module_object.ToHandleChecked();
-      weak_native_module = module_object->shared_native_module();
+      weak_native_module = module_object->native_module().as_shared_ptr();
       // Check that the native module exists at this point.
       CHECK(weak_native_module.lock());
 
@@ -289,7 +289,7 @@ UNINITIALIZED_TEST(CompiledWasmModulesTransfer) {
   create_params.array_buffer_allocator = CcTest::array_buffer_allocator();
   v8::Isolate* from_isolate = v8::Isolate::New(create_params);
   std::vector<v8::CompiledWasmModule> store;
-  std::shared_ptr<NativeModule> original_native_module;
+  Managed<NativeModule>::Ptr original_native_module;
   {
     v8::Isolate::Scope isolate_scope(from_isolate);
     v8::HandleScope scope(from_isolate);
@@ -307,7 +307,7 @@ UNINITIALIZED_TEST(CompiledWasmModulesTransfer) {
         v8::Local<v8::WasmModuleObject>::Cast(
             v8::Utils::ToLocal(Cast<JSObject>(module_object)));
     store.push_back(v8_module->GetCompiledModule());
-    original_native_module = module_object->shared_native_module();
+    original_native_module = module_object->native_module();
   }
 
   {
@@ -322,13 +322,13 @@ UNINITIALIZED_TEST(CompiledWasmModulesTransfer) {
       CHECK(!transferred_module.IsEmpty());
       DirectHandle<WasmModuleObject> module_object = Cast<WasmModuleObject>(
           v8::Utils::OpenDirectHandle(*transferred_module.ToLocalChecked()));
-      std::shared_ptr<NativeModule> transferred_native_module =
-          module_object->shared_native_module();
+      Managed<NativeModule>::Ptr transferred_native_module =
+          module_object->native_module();
       CHECK_EQ(original_native_module, transferred_native_module);
     }
     to_isolate->Dispose();
   }
-  original_native_module.reset();
+  original_native_module.Reset();
   from_isolate->Dispose();
 }
 
@@ -340,12 +340,13 @@ TEST(TierDownAfterDeserialization) {
   DirectHandle<WasmModuleObject> module_object;
   CHECK(test.Deserialize().ToHandle(&module_object));
 
-  auto* native_module = module_object->native_module();
+  Managed<wasm::NativeModule>::Ptr native_module =
+      module_object->native_module();
   CHECK_EQ(3, native_module->module()->functions.size());
   WasmCodeRefScope code_ref_scope;
   // The deserialized code must be TurboFan (we wait for tier-up before
   // serializing).
-  auto* turbofan_code = native_module->GetCode(2);
+  WasmCode* turbofan_code = native_module->GetCode(2);
   CHECK_NOT_NULL(turbofan_code);
   CHECK_EQ(ExecutionTier::kTurbofan, turbofan_code->tier());
 
@@ -377,8 +378,9 @@ TEST(SerializeLiftoffModuleFails) {
   DirectHandle<WasmModuleObject> module_object =
       maybe_module_object.ToHandleChecked();
 
-  NativeModule* native_module = module_object->native_module();
-  WasmSerializer wasm_serializer(native_module);
+  Managed<wasm::NativeModule>::Ptr native_module =
+      module_object->native_module();
+  WasmSerializer wasm_serializer(native_module.raw());
   size_t buffer_size = wasm_serializer.GetSerializedNativeModuleSize();
   std::unique_ptr<uint8_t[]> buffer(new uint8_t[buffer_size]);
   // Serialization is expected to fail if there is no TurboFan function to
@@ -397,7 +399,8 @@ TEST(SerializeTieringBudget) {
     DirectHandle<WasmModuleObject> module_object;
     CHECK(test.Deserialize().ToHandle(&module_object));
 
-    auto* native_module = module_object->native_module();
+    Managed<wasm::NativeModule>::Ptr native_module =
+        module_object->native_module();
     memcpy(native_module->tiering_budget_array(), mock_budget,
            arraysize(mock_budget) * sizeof(uint32_t));
     v8::Local<v8::Object> v8_module_obj =
@@ -419,27 +422,20 @@ TEST(SerializeTieringBudget) {
   HandleScope scope(isolate);
   DirectHandle<WasmModuleObject> module_object;
   CompileTimeImports compile_imports = test.MakeCompileTimeImports();
+  base::OwnedVector<const uint8_t> wire_bytes_copy =
+      base::OwnedCopyOf(test.wire_bytes());
   CHECK(
       DeserializeNativeModule(
           isolate, WasmEnabledFeatures::FromIsolate(isolate),
           base::VectorOf(serialized_bytes.buffer.get(), serialized_bytes.size),
-          base::VectorOf(test.wire_bytes()), compile_imports, {})
+          wire_bytes_copy, compile_imports, {})
           .ToHandle(&module_object));
 
-  auto* native_module = module_object->native_module();
+  Managed<wasm::NativeModule>::Ptr native_module =
+      module_object->native_module();
   for (size_t i = 0; i < arraysize(mock_budget); ++i) {
     CHECK_EQ(mock_budget[i], native_module->tiering_budget_array()[i]);
   }
-}
-
-TEST(DeserializeTieringBudgetPartlyMissing) {
-  WasmSerializationTest test;
-  {
-    HandleScope scope(CcTest::i_isolate());
-    test.PartlyDropTieringBudget();
-    CHECK(test.Deserialize().is_null());
-  }
-  test.CollectGarbage();
 }
 
 TEST(SerializationFailsOnChangedFlags) {
@@ -541,7 +537,7 @@ TEST(DeserializeIndirectCallWithDifferentCanonicalId) {
                             CompileTimeImports{}, &thrower,
                             base::OwnedCopyOf(zone_buffer))
               .ToHandleChecked();
-      weak_native_module = module_object->shared_native_module();
+      weak_native_module = module_object->native_module().as_shared_ptr();
 
       // Retrieve the canonicalized signature ID.
       const std::vector<CanonicalTypeIndex>& canonical_type_ids =
@@ -616,12 +612,14 @@ TEST(DeserializeIndirectCallWithDifferentCanonicalId) {
     deserialization_context->Enter();
     ErrorThrower thrower(i_isolate, "");
     base::Vector<const char> kNoSourceUrl;
+    base::OwnedVector<const uint8_t> wire_bytes_copy =
+        base::OwnedCopyOf(zone_buffer);
     DirectHandle<WasmModuleObject> module_object =
         DeserializeNativeModule(
             i_isolate, WasmEnabledFeatures::FromIsolate(i_isolate),
             base::VectorOf(serialized_module.buffer.get(),
                            serialized_module.size),
-            base::VectorOf(zone_buffer), CompileTimeImports{}, kNoSourceUrl)
+            wire_bytes_copy, CompileTimeImports{}, kNoSourceUrl)
             .ToHandleChecked();
 
     // Check that the signature ID got canonicalized to index 1.
@@ -718,7 +716,7 @@ TEST(SerializeDetectedFeatures) {
                module_object->native_module()
                    ->compilation_state()
                    ->detected_features());
-      weak_native_module = module_object->shared_native_module();
+      weak_native_module = module_object->native_module().as_shared_ptr();
 
       // Now call the tail-calling function "b". This triggers lazy compilation,
       // which should not DCHECK because of a new detected feature.
@@ -774,12 +772,14 @@ TEST(SerializeDetectedFeatures) {
     deserialization_context->Enter();
     ErrorThrower thrower(i_isolate, "");
     base::Vector<const char> kNoSourceUrl;
+    base::OwnedVector<const uint8_t> wire_bytes_copy =
+        base::OwnedCopyOf(buffer);
     DirectHandle<WasmModuleObject> module_object =
         DeserializeNativeModule(
             i_isolate, WasmEnabledFeatures::FromIsolate(i_isolate),
             base::VectorOf(serialized_module.buffer.get(),
                            serialized_module.size),
-            base::VectorOf(buffer), CompileTimeImports{}, kNoSourceUrl)
+            wire_bytes_copy, CompileTimeImports{}, kNoSourceUrl)
             .ToHandleChecked();
 
     CHECK_EQ(WasmDetectedFeatures{{WasmDetectedFeature::return_call}},

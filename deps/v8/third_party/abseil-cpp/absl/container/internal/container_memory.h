@@ -44,7 +44,12 @@ ABSL_NAMESPACE_BEGIN
 namespace container_internal {
 
 template <size_t Alignment>
-struct alignas(Alignment) AlignedType {};
+struct alignas(Alignment) AlignedType {
+  // When alignment is sufficient for the allocated memory to store pointers,
+  // include a pointer member so that swisstable backing arrays end up in the
+  // pointer-containing partition for heap partitioning.
+  std::conditional_t<(Alignment < alignof(void*)), char, void*> pointer;
+};
 
 // Allocates at least n bytes aligned to the specified alignment.
 // Alignment must be a power of 2. It must be positive.
@@ -130,6 +135,7 @@ decltype(std::declval<F>()(std::declval<T>())) WithConstructedImpl(
 template <class T, size_t... Is>
 auto TupleRefImpl(T&& t, absl::index_sequence<Is...>)
     -> decltype(std::forward_as_tuple(std::get<Is>(std::forward<T>(t))...)) {
+  // NOLINTNEXTLINE(bugprone-use-after-move)
   return std::forward_as_tuple(std::get<Is>(std::forward<T>(t))...);
 }
 
@@ -344,11 +350,11 @@ union map_slot_type {
   ~map_slot_type() = delete;
   using value_type = std::pair<const K, V>;
   using mutable_value_type =
-      std::pair<absl::remove_const_t<K>, absl::remove_const_t<V>>;
+      std::pair<std::remove_const_t<K>, std::remove_const_t<V>>;
 
   value_type value;
   mutable_value_type mutable_value;
-  absl::remove_const_t<K> key;
+  std::remove_const_t<K> key;
 };
 
 template <class K, class V>
@@ -356,7 +362,7 @@ struct map_slot_policy {
   using slot_type = map_slot_type<K, V>;
   using value_type = std::pair<const K, V>;
   using mutable_value_type =
-      std::pair<absl::remove_const_t<K>, absl::remove_const_t<V>>;
+      std::pair<std::remove_const_t<K>, std::remove_const_t<V>>;
 
  private:
   static void emplace(slot_type* slot) {

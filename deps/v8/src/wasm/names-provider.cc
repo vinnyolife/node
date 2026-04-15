@@ -41,7 +41,10 @@ void NamesProvider::ComputeFunctionNamesFromImportsExports() {
   // When tracing streaming compilations, we might not yet have wire bytes.
   if (wire_bytes_.empty()) return;
   for (const WasmImport& import : module_->import_table) {
-    if (import.kind != kExternalFunction) continue;
+    if (import.kind != kExternalFunction &&
+        import.kind != kExternalExactFunction) {
+      continue;
+    }
     if (module_->lazily_generated_names.Has(import.index)) continue;
     ComputeImportName(import, import_export_function_names_);
   }
@@ -61,6 +64,7 @@ void NamesProvider::ComputeNamesFromImportsExports() {
   for (const WasmImport import : module_->import_table) {
     switch (import.kind) {
       case kExternalFunction:
+      case kExternalExactFunction:
         continue;  // Functions are handled separately.
       case kExternalTable:
         if (name_section_names_->table_names_.Has(import.index)) continue;
@@ -83,6 +87,7 @@ void NamesProvider::ComputeNamesFromImportsExports() {
   for (const WasmExport& ex : module_->export_table) {
     switch (ex.kind) {
       case kExternalFunction:
+      case kExternalExactFunction:
         continue;  // Functions are handled separately.
       case kExternalTable:
         if (name_section_names_->table_names_.Has(ex.index)) continue;
@@ -389,7 +394,7 @@ void NamesProvider::PrintTagName(StringBuilder& out, uint32_t tag_index,
 }
 
 void NamesProvider::PrintHeapType(StringBuilder& out, HeapType type) {
-  if (type.is_index()) {
+  if (type.has_index()) {
     if (type.is_exact()) out << "exact ";
     PrintTypeName(out, type.ref_index());
   } else {
@@ -486,12 +491,12 @@ void CanonicalTypeNamesProvider::PrintTypeName(
     StringBuilder& out, CanonicalTypeIndex type_index,
     NamesProvider::IndexAsComment index_as_comment) {
   uint32_t index = type_index.index;
-  if (index > type_names_.size() || type_names_[index].empty()) {
+  if (index >= type_names_.size() || type_names_[index].empty()) {
     DecodeNameSections();
   }
   // {index} should now always be in range, but let's be robust towards
   // invalid parameter values.
-  if (index > type_names_.size() || type_names_[index].empty()) {
+  if (index >= type_names_.size() || type_names_[index].empty()) {
     out << "$canon" << index;
     return;
   }
@@ -528,7 +533,7 @@ void CanonicalTypeNamesProvider::PrintFieldName(StringBuilder& out,
                                                 CanonicalTypeIndex struct_index,
                                                 uint32_t field_index) {
   uint32_t index = struct_index.index;
-  if (index > type_names_.size()) DecodeNameSections();
+  if (index >= type_names_.size()) DecodeNameSections();
 
   auto per_type = field_names_.find(index);
   if (per_type != field_names_.end()) {
@@ -541,19 +546,6 @@ void CanonicalTypeNamesProvider::PrintFieldName(StringBuilder& out,
     }
   }
   out << "$field" << field_index;
-}
-
-// At the time of this writing, different std::string implementations
-// support 15 to 23 characters for inline storage. For accurate tracking
-// of memory consumption, dynamically determine this threshold.
-size_t CanonicalTypeNamesProvider::DetectInlineStringThreshold() {
-  for (size_t i = 0; i < 32; i++) {
-    std::string s(i, 'c');
-    Address str = reinterpret_cast<Address>(&s);
-    Address data = reinterpret_cast<Address>(s.data());
-    if (data < str || data >= str + sizeof(s)) return i;
-  }
-  return 32;
 }
 
 }  // namespace wasm

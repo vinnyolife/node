@@ -10,6 +10,7 @@
 #include "include/v8-regexp.h"
 #include "src/objects/contexts.h"
 #include "src/objects/js-array.h"
+#include "src/objects/trusted-object.h"
 #include "src/regexp/regexp-flags.h"
 #include "torque-generated/bit-fields.h"
 
@@ -30,39 +31,41 @@ class JSRegExp : public TorqueGeneratedJSRegExp<JSRegExp, JSObject> {
   DEFINE_TORQUE_GENERATED_JS_REG_EXP_FLAGS()
 
   V8_EXPORT_PRIVATE static MaybeDirectHandle<JSRegExp> New(
-      Isolate* isolate, DirectHandle<String> source, Flags flags,
+      Isolate* isolate, DirectHandle<String> original_source, Flags flags,
       uint32_t backtrack_limit = kNoBacktrackLimit);
 
   static MaybeDirectHandle<JSRegExp> Initialize(
       Isolate* isolate, DirectHandle<JSRegExp> regexp,
-      DirectHandle<String> source, Flags flags,
+      DirectHandle<String> original_source, Flags flags,
       uint32_t backtrack_limit = kNoBacktrackLimit);
   static MaybeDirectHandle<JSRegExp> Initialize(
       Isolate* isolate, DirectHandle<JSRegExp> regexp,
-      DirectHandle<String> source, DirectHandle<String> flags_string);
+      DirectHandle<String> original_source, DirectHandle<String> flags_string);
 
   DECL_ACCESSORS(last_index, Tagged<Object>)
 
   // Instance fields accessors.
-  inline Tagged<String> source() const;
+  // Returns the escaped source as specced by
+  // https://tc39.es/ecma262/#sec-escaperegexppattern.
+  inline Tagged<String> source(IsolateForSandbox isolate) const;
   inline Flags flags() const;
 
   DECL_TRUSTED_POINTER_ACCESSORS(data, RegExpData)
 
-  static constexpr Flag AsJSRegExpFlag(RegExpFlag f) {
+  static constexpr Flag AsJSRegExpFlag(regexp::Flag f) {
     return static_cast<Flag>(f);
   }
-  static constexpr Flags AsJSRegExpFlags(RegExpFlags f) {
+  static constexpr Flags AsJSRegExpFlags(regexp::Flags f) {
     return Flags{static_cast<int>(f)};
   }
-  static constexpr RegExpFlags AsRegExpFlags(Flags f) {
-    return RegExpFlags{static_cast<int>(f)};
+  static constexpr regexp::Flags AsRegExpFlags(Flags f) {
+    return regexp::Flags{static_cast<int>(f)};
   }
 
-  static std::optional<RegExpFlag> FlagFromChar(char c) {
-    std::optional<RegExpFlag> f = TryRegExpFlagFromChar(c);
+  static std::optional<regexp::Flag> FlagFromChar(char c) {
+    std::optional<regexp::Flag> f = regexp::TryFlagFromChar(c);
     if (!f.has_value()) return f;
-    if (f.value() == RegExpFlag::kLinear &&
+    if (f.value() == regexp::Flag::kLinear &&
         !v8_flags.enable_experimental_regexp_engine) {
       return {};
     }
@@ -70,22 +73,20 @@ class JSRegExp : public TorqueGeneratedJSRegExp<JSRegExp, JSObject> {
   }
 
   static_assert(static_cast<int>(kNone) == v8::RegExp::kNone);
-#define V(_, Camel, ...)                                             \
-  static_assert(static_cast<int>(k##Camel) == v8::RegExp::k##Camel); \
-  static_assert(static_cast<int>(k##Camel) ==                        \
-                static_cast<int>(RegExpFlag::k##Camel));
+#define V(_, Camel, ...)                                                   \
+  static_assert(static_cast<int>(Flag::k##Camel) == v8::RegExp::k##Camel); \
+  static_assert(static_cast<int>(Flag::k##Camel) ==                        \
+                static_cast<int>(regexp::Flag::k##Camel));
   REGEXP_FLAG_LIST(V)
 #undef V
   static_assert(kFlagCount == v8::RegExp::kFlagCount);
-  static_assert(kFlagCount == kRegExpFlagCount);
+  static_assert(kFlagCount == regexp::kFlagCount);
 
   static std::optional<Flags> FlagsFromString(Isolate* isolate,
                                               DirectHandle<String> flags);
 
   V8_EXPORT_PRIVATE static DirectHandle<String> StringFromFlags(
       Isolate* isolate, Flags flags);
-
-  inline Tagged<String> EscapedPattern();
 
   // Each capture (including the match itself) needs two registers.
   static constexpr int RegistersForCaptureCount(int count) {
@@ -107,13 +108,10 @@ class JSRegExp : public TorqueGeneratedJSRegExp<JSRegExp, JSObject> {
   /* This is already an in-object field. */
   // TODO(v8:8944): improve handling of in-object fields
   static constexpr int kLastIndexOffset = kHeaderSize;
+  static constexpr int kInObjectFieldCount = 1;
 
   // The initial value of the last_index field on a new JSRegExp instance.
   static constexpr int kInitialLastIndexValue = 0;
-
-  // In-object fields.
-  static constexpr int kLastIndexFieldIndex = 0;
-  static constexpr int kInObjectFieldCount = 1;
 
   // The actual object size including in-object fields.
   static constexpr int kSize = kHeaderSize + kInObjectFieldCount * kTaggedSize;
@@ -140,12 +138,12 @@ class JSRegExp : public TorqueGeneratedJSRegExp<JSRegExp, JSObject> {
   // Maximum number of captures allowed.
   static constexpr int kMaxCaptures = 1 << 16;
 
-  class BodyDescriptor;
-
- private:
   using FlagsBuffer = base::EmbeddedVector<char, kFlagCount + 1>;
   inline static const char* FlagsToString(Flags flags, FlagsBuffer* out_buffer);
 
+  class BodyDescriptor;
+
+ private:
   friend class RegExpData;
 
   TQ_OBJECT_CONSTRUCTORS(JSRegExp)
@@ -155,7 +153,7 @@ DEFINE_OPERATORS_FOR_FLAGS(JSRegExp::Flags)
 
 class RegExpDataWrapper;
 
-class RegExpData : public ExposedTrustedObject {
+V8_OBJECT class RegExpData : public ExposedTrustedObjectLayout {
  public:
   enum class Type : uint8_t {
     ATOM,          // A simple string match.
@@ -166,12 +164,26 @@ class RegExpData : public ExposedTrustedObject {
   inline Type type_tag() const;
   inline void set_type_tag(Type);
 
-  DECL_ACCESSORS(source, Tagged<String>)
+  inline Tagged<String> original_source() const;
+  inline void set_original_source(Tagged<String> value,
+                                  WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  inline Tagged<String> escaped_source() const;
+  inline void set_escaped_source(Tagged<String> value,
+                                 WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
   inline JSRegExp::Flags flags() const;
   inline void set_flags(JSRegExp::Flags flags);
 
-  DECL_ACCESSORS(wrapper, Tagged<RegExpDataWrapper>)
+  inline Tagged<RegExpDataWrapper> wrapper() const;
+  inline void set_wrapper(Tagged<RegExpDataWrapper> value,
+                          WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  inline uint32_t quick_check_mask() const;
+  inline void set_quick_check_mask(uint32_t value);
+
+  inline uint32_t quick_check_value() const;
+  inline void set_quick_check_value(uint32_t value);
 
   inline int capture_count() const;
 
@@ -184,65 +196,44 @@ class RegExpData : public ExposedTrustedObject {
   DECL_PRINTER(RegExpData)
   DECL_VERIFIER(RegExpData)
 
-#define FIELD_LIST(V)            \
-  V(kTypeTagOffset, kTaggedSize) \
-  V(kSourceOffset, kTaggedSize)  \
-  V(kFlagsOffset, kTaggedSize)   \
-  V(kWrapperOffset, kTaggedSize) \
-  V(kHeaderSize, 0)              \
-  V(kSize, 0)
-
-  DEFINE_FIELD_OFFSET_CONSTANTS(ExposedTrustedObject::kHeaderSize, FIELD_LIST)
-
-#undef FIELD_LIST
-
   class BodyDescriptor;
 
-  OBJECT_CONSTRUCTORS(RegExpData, ExposedTrustedObject);
-};
+  TaggedMember<Smi> type_tag_;
+  TaggedMember<String> original_source_;
+  TaggedMember<String> escaped_source_;
+  TaggedMember<Smi> flags_;
+  TaggedMember<RegExpDataWrapper> wrapper_;
+  uint32_t quick_check_mask_;
+  uint32_t quick_check_value_;
+} V8_OBJECT_END;
 
-class RegExpDataWrapper : public Struct {
+V8_OBJECT class RegExpDataWrapper : public StructLayout {
  public:
   DECL_TRUSTED_POINTER_ACCESSORS(data, RegExpData)
 
   DECL_PRINTER(RegExpDataWrapper)
   DECL_VERIFIER(RegExpDataWrapper)
 
-#define FIELD_LIST(V)                 \
-  V(kDataOffset, kTrustedPointerSize) \
-  V(kHeaderSize, 0)                   \
-  V(kSize, 0)
-
-  DEFINE_FIELD_OFFSET_CONSTANTS(Struct::kHeaderSize, FIELD_LIST)
-#undef FIELD_LIST
-
   class BodyDescriptor;
 
-  OBJECT_CONSTRUCTORS(RegExpDataWrapper, Struct);
-};
+  TrustedPointerMember<RegExpData, kRegExpDataIndirectPointerTag> data_;
+} V8_OBJECT_END;
 
-class AtomRegExpData : public RegExpData {
+V8_OBJECT class AtomRegExpData : public RegExpData {
  public:
-  DECL_ACCESSORS(pattern, Tagged<String>)
+  inline Tagged<String> pattern() const;
+  inline void set_pattern(Tagged<String> value,
+                          WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
   DECL_PRINTER(AtomRegExpData)
   DECL_VERIFIER(AtomRegExpData)
 
-#define FIELD_LIST(V)            \
-  V(kPatternOffset, kTaggedSize) \
-  V(kHeaderSize, 0)              \
-  V(kSize, 0)
-
-  DEFINE_FIELD_OFFSET_CONSTANTS(RegExpData::kHeaderSize, FIELD_LIST)
-
-#undef FIELD_LIST
-
   class BodyDescriptor;
 
-  OBJECT_CONSTRUCTORS(AtomRegExpData, RegExpData);
-};
+  TaggedMember<String> pattern_;
+} V8_OBJECT_END;
 
-class IrRegExpData : public RegExpData {
+V8_OBJECT class IrRegExpData : public RegExpData {
  public:
   DECL_CODE_POINTER_ACCESSORS(latin1_code)
   DECL_CODE_POINTER_ACCESSORS(uc16_code)
@@ -251,19 +242,24 @@ class IrRegExpData : public RegExpData {
   inline Tagged<Code> code(IsolateForSandbox isolate, bool is_one_byte) const;
   DECL_PROTECTED_POINTER_ACCESSORS(latin1_bytecode, TrustedByteArray)
   DECL_PROTECTED_POINTER_ACCESSORS(uc16_bytecode, TrustedByteArray)
+  DECL_PROTECTED_POINTER_ACCESSORS(capture_name_map, TrustedFixedArray)
+  inline void set_capture_name_map(DirectHandle<TrustedFixedArray> value);
   inline bool has_bytecode(bool is_one_byte) const;
   inline void clear_bytecode(bool is_one_byte);
   inline void set_bytecode(bool is_one_byte, Tagged<TrustedByteArray> bytecode);
   inline Tagged<TrustedByteArray> bytecode(bool is_one_byte) const;
-  DECL_ACCESSORS(capture_name_map, Tagged<Object>)
-  inline void set_capture_name_map(DirectHandle<FixedArray> capture_name_map);
-  DECL_INT_ACCESSORS(max_register_count)
+  inline int max_register_count() const;
+  inline void set_max_register_count(int value);
   // Number of captures (without the match itself).
-  DECL_INT_ACCESSORS(capture_count)
-  DECL_INT_ACCESSORS(ticks_until_tier_up)
-  DECL_INT_ACCESSORS(backtrack_limit)
+  inline int capture_count() const;
+  inline void set_capture_count(int value);
+  inline int ticks_until_tier_up() const;
+  inline void set_ticks_until_tier_up(int value);
+  inline int backtrack_limit() const;
+  inline void set_backtrack_limit(int value);
 
-  DECL_PRIMITIVE_ACCESSORS(bit_field, uint32_t)
+  inline uint32_t bit_field() const;
+  inline void set_bit_field(uint32_t value);
   DECL_BOOLEAN_ACCESSORS(can_be_zero_length)
   DECL_BOOLEAN_ACCESSORS(is_linear_executable)
 
@@ -288,28 +284,19 @@ class IrRegExpData : public RegExpData {
   DECL_PRINTER(IrRegExpData)
   DECL_VERIFIER(IrRegExpData)
 
-#define FIELD_LIST(V)                             \
-  V(kLatin1BytecodeOffset, kProtectedPointerSize) \
-  V(kUc16BytecodeOffset, kProtectedPointerSize)   \
-  V(kLatin1CodeOffset, kCodePointerSize)          \
-  V(kUc16CodeOffset, kCodePointerSize)            \
-  V(kCaptureNameMapOffset, kTaggedSize)           \
-  V(kMaxRegisterCountOffset, kTaggedSize)         \
-  V(kCaptureCountOffset, kTaggedSize)             \
-  V(kTicksUntilTierUpOffset, kTaggedSize)         \
-  V(kBacktrackLimitOffset, kTaggedSize)           \
-  V(kBitFieldOffset, kTaggedSize)                 \
-  V(kHeaderSize, 0)                               \
-  V(kSize, 0)
-
-  DEFINE_FIELD_OFFSET_CONSTANTS(RegExpData::kHeaderSize, FIELD_LIST)
-
-#undef FIELD_LIST
-
   class BodyDescriptor;
 
-  OBJECT_CONSTRUCTORS(IrRegExpData, RegExpData);
-};
+  ProtectedTaggedMember<TrustedByteArray> latin1_bytecode_;
+  ProtectedTaggedMember<TrustedByteArray> uc16_bytecode_;
+  ProtectedTaggedMember<TrustedFixedArray> capture_name_map_;
+  CodePointerMember latin1_code_;
+  CodePointerMember uc16_code_;
+  TaggedMember<Smi> max_register_count_;
+  TaggedMember<Smi> capture_count_;
+  TaggedMember<Smi> ticks_until_tier_up_;
+  TaggedMember<Smi> backtrack_limit_;
+  TaggedMember<Smi> bit_field_;
+} V8_OBJECT_END;
 
 // JSRegExpResult is just a JSArray with a specific initial map.
 // This initial map adds in-object properties for "index" and "input"
@@ -324,16 +311,8 @@ class JSRegExpResult
   // JSRegExpResult, and maybe JSRegExpResultIndices, but both have the same
   // instance type as JSArray.
 
-  // Indices of in-object properties.
-  static constexpr int kIndexIndex = 0;
-  static constexpr int kInputIndex = 1;
-  static constexpr int kGroupsIndex = 2;
-
-  // Private internal only fields.
-  static constexpr int kNamesIndex = 3;
-  static constexpr int kRegExpInputIndex = 4;
-  static constexpr int kRegExpLastIndex = 5;
-  static constexpr int kInObjectPropertyCount = 6;
+  static constexpr int kInObjectPropertyCount =
+      (kSize - JSArray::kHeaderSize) / kTaggedSize;
 
   static constexpr int kMapIndexInContext = Context::REGEXP_RESULT_MAP_INDEX;
 
@@ -344,11 +323,8 @@ class JSRegExpResultWithIndices
     : public TorqueGeneratedJSRegExpResultWithIndices<JSRegExpResultWithIndices,
                                                       JSRegExpResult> {
  public:
-  static_assert(
-      JSRegExpResult::kInObjectPropertyCount == 6,
-      "JSRegExpResultWithIndices must be a subclass of JSRegExpResult");
-  static constexpr int kIndicesIndex = 6;
-  static constexpr int kInObjectPropertyCount = 7;
+  static constexpr int kInObjectPropertyCount =
+      (kSize - JSRegExpResult::kHeaderSize) / kTaggedSize;
 
   TQ_OBJECT_CONSTRUCTORS(JSRegExpResultWithIndices)
 };
@@ -365,11 +341,10 @@ class JSRegExpResultIndices
  public:
   static DirectHandle<JSRegExpResultIndices> BuildIndices(
       Isolate* isolate, DirectHandle<RegExpMatchInfo> match_info,
-      DirectHandle<Object> maybe_names);
+      DirectHandle<RegExpData> re_data);
 
-  // Indices of in-object properties.
-  static constexpr int kGroupsIndex = 0;
-  static constexpr int kInObjectPropertyCount = 1;
+  static constexpr int kInObjectPropertyCount =
+      (kSize - JSArray::kHeaderSize) / kTaggedSize;
 
   // Descriptor index of groups.
   static constexpr int kGroupsDescriptorIndex = 1;

@@ -22,7 +22,7 @@
 #include <utility>
 
 #include "absl/base/attributes.h"
-#include "absl/base/internal/throw_delegate.h"
+#include "absl/base/throw_delegate.h"
 #include "absl/container/internal/btree.h"  // IWYU pragma: export
 #include "absl/container/internal/common.h"
 #include "absl/hash/internal/weakly_mixed_integer.h"
@@ -412,8 +412,8 @@ class btree_set_container : public btree_container<Tree> {
   // `this`, it is left unmodified in `src`.
   template <
       typename T,
-      typename absl::enable_if_t<
-          absl::conjunction<
+      typename std::enable_if_t<
+          std::conjunction<
               std::is_same<value_type, typename T::value_type>,
               std::is_same<allocator_type, typename T::allocator_type>,
               std::is_same<typename params_type::is_map_container,
@@ -431,8 +431,8 @@ class btree_set_container : public btree_container<Tree> {
 
   template <
       typename T,
-      typename absl::enable_if_t<
-          absl::conjunction<
+      typename std::enable_if_t<
+          std::conjunction<
               std::is_same<value_type, typename T::value_type>,
               std::is_same<allocator_type, typename T::allocator_type>,
               std::is_same<typename params_type::is_map_container,
@@ -474,7 +474,7 @@ class btree_map_container : public btree_set_container<Tree> {
                           typename Tree::params_type::mapped_type, M>>;
   template <class K, bool KValue, class M, bool MValue, typename... Dummy>
   using LifetimeBoundKV =
-      absl::conjunction<LifetimeBoundK<K, KValue, absl::void_t<Dummy...>>,
+      std::conjunction<LifetimeBoundK<K, KValue, absl::void_t<Dummy...>>,
                         LifetimeBoundV<M, MValue>>;
 
  public:
@@ -651,16 +651,14 @@ class btree_map_container : public btree_set_container<Tree> {
   template <typename K = key_type>
   mapped_type &at(const key_arg<K> &key) ABSL_ATTRIBUTE_LIFETIME_BOUND {
     auto it = this->find(key);
-    if (it == this->end())
-      base_internal::ThrowStdOutOfRange("absl::btree_map::at");
+    if (it == this->end()) ThrowStdOutOfRange("absl::btree_map::at");
     return it->second;
   }
   template <typename K = key_type>
   const mapped_type &at(const key_arg<K> &key) const
       ABSL_ATTRIBUTE_LIFETIME_BOUND {
     auto it = this->find(key);
-    if (it == this->end())
-      base_internal::ThrowStdOutOfRange("absl::btree_map::at");
+    if (it == this->end()) ThrowStdOutOfRange("absl::btree_map::at");
     return it->second;
   }
 
@@ -672,27 +670,36 @@ class btree_map_container : public btree_set_container<Tree> {
   std::pair<iterator, bool> insert_or_assign_impl(K &&k, M &&obj) {
     const std::pair<iterator, bool> ret =
         this->tree_.insert_unique(k, std::forward<K>(k), std::forward<M>(obj));
-    if (!ret.second) ret.first->second = std::forward<M>(obj);
+    if (!ret.second) {
+      // NOLINTNEXTLINE(bugprone-use-after-move)
+      ret.first->second = std::forward<M>(obj);
+    }
     return ret;
   }
   template <class K, class M>
   iterator insert_or_assign_hint_impl(const_iterator hint, K &&k, M &&obj) {
     const std::pair<iterator, bool> ret = this->tree_.insert_hint_unique(
         iterator(hint), k, std::forward<K>(k), std::forward<M>(obj));
-    if (!ret.second) ret.first->second = std::forward<M>(obj);
+    if (!ret.second) {
+      // NOLINTNEXTLINE(bugprone-use-after-move)
+      ret.first->second = std::forward<M>(obj);
+    }
     return ret.first;
   }
 
   template <class K, class... Args>
   std::pair<iterator, bool> try_emplace_impl(K &&k, Args &&... args) {
     return this->tree_.insert_unique(
+        // NOLINTNEXTLINE(bugprone-use-after-move)
         k, std::piecewise_construct, std::forward_as_tuple(std::forward<K>(k)),
         std::forward_as_tuple(std::forward<Args>(args)...));
   }
   template <class K, class... Args>
   iterator try_emplace_hint_impl(const_iterator hint, K &&k, Args &&... args) {
     return this->tree_
-        .insert_hint_unique(iterator(hint), k, std::piecewise_construct,
+        .insert_hint_unique(iterator(hint),
+                            // NOLINTNEXTLINE(bugprone-use-after-move)
+                            k, std::piecewise_construct,
                             std::forward_as_tuple(std::forward<K>(k)),
                             std::forward_as_tuple(std::forward<Args>(args)...))
         .first;
@@ -817,8 +824,8 @@ class btree_multiset_container : public btree_container<Tree> {
   // Moves all elements from `src` into `this`.
   template <
       typename T,
-      typename absl::enable_if_t<
-          absl::conjunction<
+      typename std::enable_if_t<
+          std::conjunction<
               std::is_same<value_type, typename T::value_type>,
               std::is_same<allocator_type, typename T::allocator_type>,
               std::is_same<typename params_type::is_map_container,
@@ -833,8 +840,8 @@ class btree_multiset_container : public btree_container<Tree> {
 
   template <
       typename T,
-      typename absl::enable_if_t<
-          absl::conjunction<
+      typename std::enable_if_t<
+          std::conjunction<
               std::is_same<value_type, typename T::value_type>,
               std::is_same<allocator_type, typename T::allocator_type>,
               std::is_same<typename params_type::is_map_container,
